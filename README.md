@@ -95,6 +95,40 @@ is first converted to an absolute bound, then interpreted with the selected norm
 Run the CPU regression checks with `python3 tests/test_l2.py` (set `CXX` to a
 C++ compiler with OpenMP support if needed).
 
+### Search for an epsilon that satisfies both bounds
+
+Pass the per-value epsilon in the usual position and the absolute whole-array
+L2 budget separately. For example, the standalone CPU commands below allow
+an error of at most 0.125 per value and a Euclidean residual norm of at most
+0.5 across the file.
+
+```bash
+./sleek_single_compressor_lossy_cpu input.bin compressed.bin 0.125 --l2-budget 0.5
+./sleek_single_decompressor_lossy_cpu compressed.bin restored.bin 0.125
+./runtests.sh /path/to/float32-inputs --l2-budget 0.5
+```
+
+The compressor tries the cap first. Each trial encodes and decodes the input
+and checks the actual residuals. If the first trial fails, the compressor tries
+a quantizer near the conservative budget divided by the square root of the
+element count, then bisects the bracket of codec exponents. SLEEK uses only
+the exponent of epsilon. The search keeps the bytes from a passing trial.
+Raw fallback chunks can change error and compressed size between trials, so
+the search does not guarantee the smallest possible file.
+
+The budget is absolute in both standalone and ARTIFACT builds. ARTIFACT
+continues to scale the positional cap by the input range and requires the original
+file for decompression. A zero budget requires exact reconstruction of finite
+values. Matching infinities and pairs of NaNs contribute zero residual.
+If no tested setting passes, compression fails before opening the output file.
+
+Searched files include a precision-specific prefix and the selected absolute
+epsilon. Use the updated decoder with the usual positional arguments. It reads
+the selected epsilon directly. Plain and legacy `-L2` files retain their existing
+format and command lines. With `--l2-budget`, the sweep CSV records the absolute
+cap, budget, selected epsilon, trial count, measured errors, and compression
+ratio including the prefix. Sweep compression time includes all search trials.
+
 ### Detailed Explanation
 
 The codes can be found in 4 different folders, separated by lossless and lossy CPU and GPU implementations. Each folder contains a separate compressor and decompressor `.cu` or `.cpp` file for single- and double-precision, for a total of 4 files.

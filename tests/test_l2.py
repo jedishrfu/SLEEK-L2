@@ -51,4 +51,26 @@ for precision,fmt in [('single','f'),('double','d')]:
   run([bins[0],src,w/'bad',bound,'l2'],False)
   for b in ['0','-1','nan','inf','1e-38' if fmt=='f' else '1e-308']:
    run([bins[0],src,w/'bad',b,'-L2'],False)
+  # Use compressible multi-chunk data so a tight budget actually changes the quantizer.
+  n = 4097
+  vals = [math.sin(i / 50) + i % 3 for i in range(n)]
+  src.write_bytes(struct.pack(f'{n}{fmt}', *vals))
+  vals = struct.unpack(f'{n}{fmt}', src.read_bytes())
+  cap = 0.125
+  absolute_cap = cap * (max(vals) - min(vals)) if artifact else cap
+  for budget in [100., 0.03125, 0.]:
+   trial = run([bins[0], '--l2-budget', budget, src, w/'searched', cap])
+   stats = dict(line.split(': ', 1) for line in trial.stdout.decode().splitlines() if ': ' in line)
+   selected = float(stats['selected epsilon'])
+   assert int(stats['encoded size'].split()[0]) == (w/'searched').stat().st_size
+   assert (int(stats['search trials']) == 1) == (budget == 100.)
+   assert 0 < selected <= absolute_cap
+   run([bins[1], w/'searched', w/'decoded', cap, *args_orig])
+   decoded = struct.unpack(f'{n}{fmt}', (w/'decoded').read_bytes())
+   residuals = [a-b for a,b in zip(vals, decoded)]
+   assert max(map(abs, residuals)) <= absolute_cap
+   assert math.hypot(*residuals) <= budget
+  for options in [['--l2-budget'], ['--l2-budget','nan'], ['--l2-budget','-1'],
+                  ['--l2-budget','1','-L2'], ['--l2-budget','1','--l2-budget','2']]:
+   run([bins[0], src, w/'bad', cap, *options], False)
   print(precision, 'artifact' if artifact else 'standalone', 'passed')

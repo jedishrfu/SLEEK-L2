@@ -42,6 +42,7 @@ Sponsor: This material is based upon work supported by the U.S. National Science
 #include "sleek_lossy_cpu.h"
 #include <sys/time.h>
 #include "sleek_norm.h"
+#include "sleek_search.h"
 
 
 struct CPUTimer
@@ -78,18 +79,22 @@ int main(int argc, char* argv [])
   printf("CPU SLEEK 1.0: single-precision lossy compressor\n");
   printf("Copyright 2026 Texas State University\n\n");
 
+  const long double budget = sleek_parse_budget(argc, argv);
   const char* norm = sleek_parse_norm_flag(argc, argv);
 
-  if (argc != 4) {printf("USAGE: %s [-L2] input_file_name compressed_file_name error_bound\n\n", argv[0]); return -1;}
+  if (budget >= 0 && std::strcmp(norm, "linf") != 0) sleek_search_error("choose -L2 or --l2-budget");
+  if (argc != 4) {printf("USAGE: %s [-L2 | --l2-budget B] input_file_name compressed_file_name error_bound\n\n", argv[0]); return -1;}
 
   // system check
   if (sleek_system_checks() != 0) {return -1;}
 
   // read input file
   FILE* const fin = fopen(argv[1], "rb");
+  if (!fin) sleek_search_error("could not open input");
   fseek(fin, 0, SEEK_END);
   const long long fsize = ftell(fin);
   if (fsize <= 0) {fprintf(stderr, "ERROR: input file too small\n\n"); return -1;}
+  if (fsize % sizeof(double) != 0) {fprintf(stderr, "ERROR: size of input must be a multiple of %ld bytes\n", sizeof(double)); return -1;}
   const long long num_elements = fsize / sizeof(double);
   double* const input = new double [num_elements];
   fseek(fin, 0, SEEK_SET);
@@ -98,12 +103,26 @@ int main(int argc, char* argv [])
   fclose(fin);
   printf("original size: %lld bytes\n", insize);
 
-  if (insize % sizeof(double) != 0) {fprintf(stderr, "ERROR: size of input must be a multiple of %ld bytes\n", sizeof(double)); return -1;}
-
   // allocate CPU memory
   const long long maxsize = sleek_upper_bound_size(insize);
   byte* const hencoded = new byte [maxsize];
   long long hencsize = 0;
+
+  if (budget >= 0) {
+    const long double cap = sleek_search_cap(argv[3], input, num_elements);
+    auto round_trip = [&](double epsilon, double* decoded) {
+      const auto info = sleek_error_bound(epsilon);
+      sleek_compress_cpu(info, input, num_elements, hencoded, hencsize);
+      long long size = 0;
+      sleek_decompress_cpu(info, hencoded, decoded, size);
+      if (size != insize) sleek_search_error("trial decoded size mismatch");
+      return hencsize;
+    };
+    sleek_search_compress(input, num_elements, cap, budget, hencoded, round_trip, argv[2]);
+    delete [] hencoded;
+    delete [] input;
+    return 0;
+  }
 
   #if defined(ARTIFACT)
 

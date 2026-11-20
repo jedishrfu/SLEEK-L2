@@ -42,6 +42,7 @@ Sponsor: This material is based upon work supported by the U.S. National Science
 #include "sleek_lossy_cpu.h"
 #include <sys/time.h>
 #include "sleek_norm.h"
+#include "sleek_search.h"
 #include "MAXABS_f32.h"
 
 
@@ -93,15 +94,17 @@ int main(int argc, char* argv [])
   // read input file
   FILE* const fin = fopen(argv[1], "rb");
   long long pre_size = 0;
-  const long long pre_val = fread(&pre_size, sizeof(pre_size), 1, fin); assert(pre_val == 1);
+  float selected = 0;
+  const long prefix = sleek_read_search_prefix(fin, pre_size, selected);
   fseek(fin, 0, SEEK_END);
-  const long long hencsize = ftell(fin);  assert(hencsize > 0);
+  const long long hencsize = ftell(fin) - prefix;
+  if (hencsize < (long long)sizeof(pre_size)) sleek_search_error("missing compressed payload");
   byte* const hencoded = new byte [std::max(pre_size, hencsize)];
-  fseek(fin, 0, SEEK_SET);
+  fseek(fin, prefix, SEEK_SET);
   // all "*size" variables in bytes
   const long long insize = fread(hencoded, 1, hencsize, fin);  assert(insize == hencsize);
   fclose(fin);
-  printf("encoded size: %lld bytes\n", insize);
+  printf("encoded size: %lld bytes\n", insize + prefix);
 
   // allocate CPU memory
   float* hdecoded = new float [pre_size / sizeof(float)];
@@ -113,6 +116,7 @@ int main(int argc, char* argv [])
     FILE* const fin_orig = fopen(argv[4], "rb");
     fseek(fin_orig, 0, SEEK_END);
     const long long fsize_orig = ftell(fin_orig);
+    if (prefix && fsize_orig != pre_size) sleek_search_error("original file size does not match stream");
     if (fsize_orig <= 0) {fprintf(stderr, "ERROR: original input file too small\n\n"); return -1;}
     const long long num_elements = fsize_orig / sizeof(float);
     float* const input_orig = new float [num_elements];
@@ -121,8 +125,8 @@ int main(int argc, char* argv [])
     fclose(fin_orig);
 
     // eb variables
-    const float parameter = std::stof(argv[3]);
-    const float eb = sleek_norm_error_bound(computeNOAeb((float*) input_orig, insize_orig / sizeof(float), parameter), pre_size / sizeof(float), norm);
+    const float parameter = prefix ? selected : std::stof(argv[3]);
+    const float eb = prefix ? selected : sleek_norm_error_bound(computeNOAeb((float*) input_orig, insize_orig / sizeof(float), parameter), pre_size / sizeof(float), norm);
     const auto eb_info = sleek_error_bound(eb);
 
     // warm up
@@ -141,7 +145,7 @@ int main(int argc, char* argv [])
     MAXABS_f32(insize_orig, (byte*) hdecoded, (byte*) input_orig, eb);
 
     printf("decoded size: %lld bytes\n", hdecsize);
-    const float CR = (100.0 * insize) / hdecsize;
+    const float CR = (100.0 * (insize + prefix)) / hdecsize;
     printf("ratio: %6.2f%% %7.3fx\n", CR, 100.0 / CR);
 
     printf("decoding time: %.6f s\n", hruntime);
@@ -151,13 +155,13 @@ int main(int argc, char* argv [])
   #else
 
     // eb variables
-    const float eb = sleek_norm_error_bound(std::stof(argv[3]), pre_size / sizeof(float), norm);
+    const float eb = prefix ? selected : sleek_norm_error_bound(std::stof(argv[3]), pre_size / sizeof(float), norm);
     const auto eb_info = sleek_error_bound(eb);
 
     sleek_decompress_cpu(eb_info, hencoded, hdecoded, hdecsize);
 
     printf("decoded size: %lld bytes\n", hdecsize);
-    const float CR = (100.0 * insize) / hdecsize;
+    const float CR = (100.0 * (insize + prefix)) / hdecsize;
     printf("ratio: %6.2f%% %7.3fx\n", CR, 100.0 / CR);
 
   #endif

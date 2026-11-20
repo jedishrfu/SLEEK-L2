@@ -35,6 +35,7 @@ FIELDS = [
     'file', 'command', 'command_args', 'original_bytes', 'compressed_bytes',
     'compression_ratio', 'exact_reconstruction', 'compression_time_seconds',
     'compression_throughput_MB_s', 'decompression_time_seconds',
+    'l2_budget', 'absolute_l_inf_cap', 'selected_epsilon', 'search_trials',
     'decompression_throughput_MB_s', 'mode', 'epsilon', 'rmse', 'l_inf', 'l2', 'source_epsilon',
 ]
 MODES = [('lossless', False, False), ('lossy_with_L2', True, True)]
@@ -49,7 +50,7 @@ def timed_run(command, timeout):
     if result.returncode:
         raise RuntimeError(f'Command failed ({result.returncode}): {shlex.join(command)}\n'
                            f'{result.stdout}\n{result.stderr}')
-    return elapsed
+    return elapsed, result.stdout
 
 
 def reconstruction_errors(original, restored, precision):
@@ -102,7 +103,11 @@ def main():
                         help='Directory containing standalone SLEEK executables')
     parser.add_argument('--timeout', type=float, default=300,
                         help='Maximum seconds per compressor/decompressor command (default: 300)')
+    parser.add_argument('--l2-budget', type=float,
+                        help='Search each L-inf sweep point with this absolute whole-file L2 budget')
     args = parser.parse_args()
+    if args.l2_budget is not None and (not math.isfinite(args.l2_budget) or args.l2_budget < 0):
+        parser.error('--l2-budget must be finite and nonnegative')
     src = args.input.expanduser().resolve()
     output = args.output.expanduser().resolve()
     if not src.is_file():
@@ -159,14 +164,17 @@ def main():
                 decomp.append(format(epsilon, '.17g'))
                 if needs_original:
                     decomp.append(str(src))
-                if l2:
+                if l2 and args.l2_budget is not None:
+                    mode = 'lossy_dual_bound_search'
+                    comp.extend(['--l2-budget', str(args.l2_budget)])
+                elif l2:
                     comp.append('-L2')
                     decomp.append('-L2')
-            compression_time = timed_run(comp, args.timeout)
+            compression_time, log = timed_run(comp, args.timeout)
             compressed_bytes = compressed.stat().st_size
             if compressed_bytes <= 0:
                 raise RuntimeError(f'{mode}: compressor produced an empty file')
-            decompression_time = timed_run(decomp, args.timeout)
+            decompression_time, _ = timed_run(decomp, args.timeout)
             if restored.stat().st_size != original_bytes:
                 raise RuntimeError(f'{mode}: reconstructed size differs from input')
             exact = filecmp.cmp(src, restored, shallow=False)
@@ -174,6 +182,14 @@ def main():
             if not lossy and not exact:
                 raise RuntimeError(f'{mode}: lossless reconstruction is not byte-identical')
             errors = reconstruction_errors(src, restored, args.precision)
+            search = {}
+            if l2 and args.l2_budget is not None:
+                stats = dict(line.split(': ', 1) for line in log.splitlines() if ': ' in line)
+                cap = float(stats['absolute L-inf cap'])
+                if errors['l_inf'] > cap or errors['l2'] > args.l2_budget:
+                    raise RuntimeError('Reconstructed data exceeds the requested bounds')
+                search = dict(l2_budget=args.l2_budget, absolute_l_inf_cap=cap,
+                              selected_epsilon=stats['selected epsilon'], search_trials=stats['search trials'])
             writer.writerow(dict(
                 file=src.name, command=f'SLEEK {args.precision} {args.backend} {codec}',
                 command_args=shlex.join(comp[1:]) + ' ; decompress: ' + shlex.join(decomp),
@@ -184,7 +200,7 @@ def main():
                 decompression_time_seconds=decompression_time,
                 decompression_throughput_MB_s=original_bytes / 1e6 / decompression_time,
                 mode=mode, epsilon=format(epsilon, '.17g'),
-                source_epsilon=source_epsilon, **errors))
+                source_epsilon=source_epsilon, **errors, **search))
             report.flush()
             print(f'{mode}: epsilon={epsilon:.6g}, ratio={original_bytes / compressed_bytes:.4f}x',
                   file=sys.stderr)

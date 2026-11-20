@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run one sweep per file and collect all rows in a fresh results CSV.
-# Usage: ./runtests.sh [input-directory] [additional sweep options]
+# Usage: ./runtests.sh [input-directory] [--l2-budget B] [additional sweep options]
 set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 input_dir="${1:-/home/LC/SDRbench_inputs/ISABEL/100x500x500/}"

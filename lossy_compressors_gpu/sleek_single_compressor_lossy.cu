@@ -41,6 +41,7 @@ Sponsor: This material is based upon work supported by the U.S. National Science
 
 #include "sleek_lossy_gpu.h"
 #include "sleek_norm.h"
+#include "sleek_search.h"
 #include <string>
 #include <cmath>
 #include <cassert>
@@ -81,18 +82,22 @@ int main(int argc, char* argv [])
   printf("GPU SLEEK 1.0: single-precision lossy compressor\n");
   printf("Copyright 2026 Texas State University\n\n");
 
+  const long double budget = sleek_parse_budget(argc, argv);
   const char* norm = sleek_parse_norm_flag(argc, argv);
 
-  if (argc != 4) {printf("USAGE: %s [-L2] input_file_name compressed_file_name error_bound\n\n", argv[0]); return -1;}
+  if (budget >= 0 && std::strcmp(norm, "linf") != 0) sleek_search_error("choose -L2 or --l2-budget");
+  if (argc != 4) {printf("USAGE: %s [-L2 | --l2-budget B] input_file_name compressed_file_name error_bound\n\n", argv[0]); return -1;}
 
   // system check
   if (sleek_system_checks() != 0) {return -1;}
 
   // read input file
   FILE* const fin = fopen(argv[1], "rb");
+  if (!fin) sleek_search_error("could not open input");
   fseek(fin, 0, SEEK_END);
   const long long fsize = ftell(fin);
   if (fsize <= 0) {fprintf(stderr, "ERROR: input file too small\n\n"); return -1;}
+  if (fsize % sizeof(float) != 0) {fprintf(stderr, "ERROR: size of input must be a multiple of %ld bytes\n", sizeof(float)); return -1;}
   const long long num_elements = fsize / sizeof(float);
   float* const input = new float [num_elements];
   fseek(fin, 0, SEEK_SET);
@@ -100,8 +105,6 @@ int main(int argc, char* argv [])
   const long long insize = fread(input, 1, fsize, fin);  assert(insize == fsize);
   fclose(fin);
   printf("original size: %lld bytes\n", insize);
-
-  if (insize % sizeof(float) != 0) {fprintf(stderr, "ERROR: size of input must be a multiple of %ld bytes\n", sizeof(float)); return -1;}
 
   // allocate GPU memory
   const long long maxsize = sleek_upper_bound_size(insize);
@@ -117,6 +120,37 @@ int main(int argc, char* argv [])
   CheckCuda(__LINE__);
 
   const int blocks = sleek_thread_blocks();
+
+  if (budget >= 0) {
+    const long double cap = sleek_search_cap(argv[3], input, num_elements);
+    float* d_trial;
+    long long* d_decsize;
+    if (cudaMalloc((void**)&d_trial, insize) != cudaSuccess ||
+        cudaMalloc((void**)&d_decsize, sizeof(long long)) != cudaSuccess)
+      sleek_search_error("GPU trial allocation failed");
+    auto round_trip = [&](float epsilon, float* decoded) {
+      const auto info = sleek_error_bound(epsilon);
+      sleek_compress_gpu(blocks, info, d_input, num_elements, d_encoded, d_encsize);
+      sleek_decompress_gpu(blocks, info, d_encoded, d_trial, d_decsize);
+      long long encoded_size, decoded_size;
+      if (cudaMemcpy(&encoded_size, d_encsize, sizeof(encoded_size), cudaMemcpyDeviceToHost) != cudaSuccess ||
+          cudaMemcpy(&decoded_size, d_decsize, sizeof(decoded_size), cudaMemcpyDeviceToHost) != cudaSuccess ||
+          decoded_size != insize || encoded_size <= 0 || encoded_size > maxsize ||
+          cudaMemcpy(decoded, d_trial, insize, cudaMemcpyDeviceToHost) != cudaSuccess ||
+          cudaMemcpy(dencoded, d_encoded, encoded_size, cudaMemcpyDeviceToHost) != cudaSuccess)
+        sleek_search_error("GPU trial round trip failed");
+      return encoded_size;
+    };
+    sleek_search_compress(input, num_elements, cap, budget, dencoded, round_trip, argv[2]);
+    cudaFree(d_trial);
+    cudaFree(d_decsize);
+    cudaFree(d_input);
+    cudaFree(d_encoded);
+    cudaFree(d_encsize);
+    cudaFreeHost(dencoded);
+    delete [] input;
+    return 0;
+  }
 
   #if defined(ARTIFACT)
 
