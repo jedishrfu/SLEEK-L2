@@ -65,6 +65,22 @@ static const int SLEEK_TPB = 512;  // threads per block [must be power of 2 and 
 #endif
 
 
+template <typename T>
+static __device__ __forceinline__ T sleek_warp_max(T value)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  if constexpr (sizeof(T) == 4) {
+    return __reduce_max_sync(~0u, value);
+  }
+#endif
+  #pragma unroll
+  for (int offset = 1; offset < SLEEK_WS; offset *= 2) {
+    value = max(value, __shfl_xor(value, offset));
+  }
+  return value;
+}
+
+
 static inline void CheckCuda(const int line)
 {
   cudaError_t e;
@@ -376,16 +392,7 @@ static __device__ inline bool d_SLEEK(int& csize, byte in [SLEEK_CS], byte out [
       max_val = max(max_val, val);
     }
 
-    // warp level max
-    if constexpr (TB == 32) {
-      max_val = __reduce_max_sync(~0, max_val);
-    } else {
-      max_val = max(max_val, __shfl_xor(max_val, 1));
-      max_val = max(max_val, __shfl_xor(max_val, 2));
-      max_val = max(max_val, __shfl_xor(max_val, 4));
-      max_val = max(max_val, __shfl_xor(max_val, 8));
-      max_val = max(max_val, __shfl_xor(max_val, 16));
-    }
+    max_val = sleek_warp_max(max_val);
 
     // figure out number of bits needed
     if (lane == i) {
@@ -850,16 +857,7 @@ static __device__ inline bool d_SLEEK(int& csize, byte in [SLEEK_CS], byte out [
       max_val = max(max_val, val);
     }
 
-    // warp level max
-    if constexpr (TB == 32) {
-      max_val = __reduce_max_sync(~0, max_val);
-    } else {
-      max_val = max(max_val, __shfl_xor(max_val, 1));
-      max_val = max(max_val, __shfl_xor(max_val, 2));
-      max_val = max(max_val, __shfl_xor(max_val, 4));
-      max_val = max(max_val, __shfl_xor(max_val, 8));
-      max_val = max(max_val, __shfl_xor(max_val, 16));
-    }
+    max_val = sleek_warp_max(max_val);
 
     // figure out number of bits needed
     if (lane == i) {
