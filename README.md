@@ -108,6 +108,14 @@ an error of at most 0.125 per value and a Euclidean residual norm of at most
 ./runtests.sh /path/to/float32-inputs --l2-budget 0.5
 ```
 
+Run `./runtests.sh /path/to/float32-inputs` for the default lossy sweep.
+At each of ten epsilon settings, the script measures an L-inf-only baseline
+and searches with L2 budgets of 1.10, 0.90, 0.50, and 0.10 times its measured
+L2. An exact baseline yields one zero-budget search. Use
+`--budget-fractions 1.1 0.5` to choose multipliers or `--l2-budget 0.5`
+for a fixed absolute budget. Each attempted round trip has a pass/fail row.
+The batch starts a fresh `sleek_results.csv` in the script directory.
+
 The compressor tries the cap first. Each trial encodes and decodes the input
 and checks the actual residuals. If the first trial fails, the compressor tries
 a quantizer near the conservative budget divided by the square root of the

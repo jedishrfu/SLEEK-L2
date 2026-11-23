@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run one sweep per file and collect all rows in a fresh results CSV.
-# Usage: ./runtests.sh [input-directory] [--l2-budget B] [additional sweep options]
+# Usage: ./runtests.sh [input-directory] [--budget-fractions F ... | --l2-budget B] [additional sweep options]
 set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 input_dir="${1:-/home/LC/SDRbench_inputs/ISABEL/100x500x500/}"
@@ -17,7 +17,7 @@ for arg in "$@"; do
             exit 1 ;;
     esac
 done
-shopt -s nullglob dotglob
+shopt -s nullglob
 files=()
 for input in "$input_dir"/*; do
     [[ -f "$input" ]] && files+=("$input")
@@ -28,8 +28,10 @@ if (( ${#files[@]} == 0 )); then
 fi
 output="$script_dir/sleek_results.csv"
 : > "$output"
+failed=0
 for input in "${files[@]}"; do
     echo "Running sweep: $input"
-    python3 "$script_dir/run_sleek_sweep.py" "$input" --append --output "$output" "$@"
+    python3 "$script_dir/run_sleek_sweep.py" "$input" --append --output "$output" "$@" || failed=1
 done
 echo "Completed ${#files[@]} files. Results: $output"
+exit "$failed"

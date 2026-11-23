@@ -1,22 +1,8 @@
 #!/usr/bin/env python3
-"""Benchmark SLEEK binaries with an epsilon sweep and matched L-inf runs.
-
-Example (run from the SLEEK directory after compiling standalone binaries):
-    python3 run_sleek_sweep.py data.f32 -o results.csv
-    python3 run_sleek_sweep.py data.f64 --precision double --backend gpu
-
-Lossless ignores epsilon and has no -L2 option. It is repeated at each sweep
-point for comparison. Exact reconstruction satisfies either norm.
-Times include process startup and file I/O; MB/s uses decimal megabytes.
-Only the Python standard library is required. Temporary codec files are removed.
-Each -L2 run is followed by a run without -L2 using its measured L-inf
-as the absolute error tolerance. Zero-error follow-ups are skipped because
-SLEEK requires a positive lossy bound. source_epsilon links each follow-up
-to the requested epsilon of its -L2 run. ARTIFACT builds receive the equivalent
-range-relative tolerance.
-Each row includes measured RMSE, L-inf, and unnormalized L2 errors against the
-original input, separate from the requested epsilon. Binary floats use native
-byte order, matching the standalone codecs. Nonfinite data/errors are rejected.
+"""Benchmark lossy SLEEK at ten L-inf caps from 0.01 through 10.
+For each cap, measure an L-inf-only baseline and use its whole-file L2
+error to set the search budgets. Verify errors after every round trip.
+Use --l2-budget B for a fixed absolute budget instead.
 """
 import argparse
 from array import array
@@ -32,13 +18,15 @@ import tempfile
 import time
 
 FIELDS = [
-    'file', 'command', 'command_args', 'original_bytes', 'compressed_bytes',
+    'file', 'command', 'command_args', 'decompress_command', 'decompress_args',
+    'original_bytes', 'compressed_bytes',
     'compression_ratio', 'exact_reconstruction', 'compression_time_seconds',
     'compression_throughput_MB_s', 'decompression_time_seconds',
     'l2_budget', 'absolute_l_inf_cap', 'selected_epsilon', 'search_trials',
-    'decompression_throughput_MB_s', 'mode', 'epsilon', 'rmse', 'l_inf', 'l2', 'source_epsilon',
+    'decompression_throughput_MB_s', 'mode', 'epsilon', 'rmse', 'l_inf', 'l2',
+    'budget_fraction', 'baseline_l2', 'baseline_cr', 'status', 'failure',
 ]
-MODES = [('lossless', False, False), ('lossy_with_L2', True, True)]
+DEFAULT_FRACTIONS = [1.1, 0.9, 0.5, 0.1]
 EPSILONS = [0.01 * 1000 ** (i / 9) for i in range(10)]
 EPSILONS[0], EPSILONS[-1] = 0.01, 10.0
 
@@ -103,11 +91,16 @@ def main():
                         help='Directory containing standalone SLEEK executables')
     parser.add_argument('--timeout', type=float, default=300,
                         help='Maximum seconds per compressor/decompressor command (default: 300)')
-    parser.add_argument('--l2-budget', type=float,
+    budgets = parser.add_mutually_exclusive_group()
+    budgets.add_argument('--budget-fractions', nargs='+', type=float, default=DEFAULT_FRACTIONS,
+                         help='Multipliers of baseline L2 (default: 1.1 0.9 0.5 0.1)')
+    budgets.add_argument('--l2-budget', type=float,
                         help='Search each L-inf sweep point with this absolute whole-file L2 budget')
     args = parser.parse_args()
     if args.l2_budget is not None and (not math.isfinite(args.l2_budget) or args.l2_budget < 0):
         parser.error('--l2-budget must be finite and nonnegative')
+    if any(not math.isfinite(f) or f < 0 for f in args.budget_fractions):
+        parser.error('Budget fractions must be finite and nonnegative')
     src = args.input.expanduser().resolve()
     output = args.output.expanduser().resolve()
     if not src.is_file():
@@ -122,18 +115,16 @@ def main():
         parser.error('Output CSV must differ from the input file')
     suffix = '_cpu' if args.backend == 'cpu' else ''
     binaries = {}
-    for codec in ['lossy', 'lossless']:
-        for operation in ['compressor', 'decompressor']:
-            path = (args.bin_dir.expanduser().resolve() /
-                    f'sleek_{args.precision}_{operation}_{codec}{suffix}')
-            if not path.is_file() or not os.access(path, os.X_OK):
-                parser.error(f'Missing executable: {path}. Compile standalone SLEEK binaries first.')
-            if output == path:
-                parser.error('Output CSV must differ from codec executables')
-            binaries[codec, operation] = str(path)
+    for operation in ['compressor', 'decompressor']:
+        path = args.bin_dir.expanduser().resolve() / f'sleek_{args.precision}_{operation}_lossy{suffix}'
+        if not path.is_file() or not os.access(path, os.X_OK):
+            parser.error(f'Missing executable: {path}. Compile standalone SLEEK binaries first.')
+        if output == path:
+            parser.error('Output CSV must differ from codec executables')
+        binaries[operation] = str(path)
     output.parent.mkdir(parents=True, exist_ok=True)
     # ARTIFACT builds require the original input for lossy decompression.
-    usage = subprocess.run([binaries['lossy', 'decompressor'], '--help'],
+    usage = subprocess.run([binaries['decompressor'], '--help'],
                            capture_output=True, text=True, timeout=args.timeout)
     needs_original = 'original_file_name' in usage.stdout + usage.stderr
     has_header = args.append and output.exists() and output.stat().st_size > 0
@@ -149,63 +140,59 @@ def main():
         report.flush()
         compressed = Path(work) / 'compressed.bin'
         restored = Path(work) / 'restored.bin'
-        print('Lossless rows ignore epsilon and L2 (exact reconstruction).', file=sys.stderr)
+        failures = 0
         row_count = 0
 
-        def run_case(mode, lossy, l2, epsilon, source_epsilon=''):
-            nonlocal row_count
-            codec = 'lossy' if lossy else 'lossless'
-            compressed.unlink(missing_ok=True)
-            restored.unlink(missing_ok=True)
-            comp = [binaries[codec, 'compressor'], str(src), str(compressed)]
-            decomp = [binaries[codec, 'decompressor'], str(compressed), str(restored)]
-            if lossy:
-                comp.append(format(epsilon, '.17g'))
-                decomp.append(format(epsilon, '.17g'))
-                if needs_original:
-                    decomp.append(str(src))
-                if l2 and args.l2_budget is not None:
-                    mode = 'lossy_dual_bound_search'
-                    comp.extend(['--l2-budget', str(args.l2_budget)])
-                elif l2:
-                    comp.append('-L2')
-                    decomp.append('-L2')
-            compression_time, log = timed_run(comp, args.timeout)
-            compressed_bytes = compressed.stat().st_size
-            if compressed_bytes <= 0:
-                raise RuntimeError(f'{mode}: compressor produced an empty file')
-            decompression_time, _ = timed_run(decomp, args.timeout)
-            if restored.stat().st_size != original_bytes:
-                raise RuntimeError(f'{mode}: reconstructed size differs from input')
-            exact = filecmp.cmp(src, restored, shallow=False)
-            filecmp.clear_cache()
-            if not lossy and not exact:
-                raise RuntimeError(f'{mode}: lossless reconstruction is not byte-identical')
-            errors = reconstruction_errors(src, restored, args.precision)
-            search = {}
-            if l2 and args.l2_budget is not None:
-                stats = dict(line.split(': ', 1) for line in log.splitlines() if ': ' in line)
-                cap = float(stats['absolute L-inf cap'])
-                if errors['l_inf'] > cap or errors['l2'] > args.l2_budget:
-                    raise RuntimeError('Reconstructed data exceeds the requested bounds')
-                search = dict(l2_budget=args.l2_budget, absolute_l_inf_cap=cap,
-                              selected_epsilon=stats['selected epsilon'], search_trials=stats['search trials'])
-            writer.writerow(dict(
-                file=src.name, command=f'SLEEK {args.precision} {args.backend} {codec}',
-                command_args=shlex.join(comp[1:]) + ' ; decompress: ' + shlex.join(decomp),
-                original_bytes=original_bytes, compressed_bytes=compressed_bytes,
-                compression_ratio=original_bytes / compressed_bytes,
-                exact_reconstruction=exact, compression_time_seconds=compression_time,
-                compression_throughput_MB_s=original_bytes / 1e6 / compression_time,
-                decompression_time_seconds=decompression_time,
-                decompression_throughput_MB_s=original_bytes / 1e6 / decompression_time,
-                mode=mode, epsilon=format(epsilon, '.17g'),
-                source_epsilon=source_epsilon, **errors, **search))
+        def run_case(epsilon, cap, budget=None, fraction=None, baseline=None):
+            nonlocal failures, row_count
+            mode = 'lossy_l_inf_only' if budget is None else 'lossy_dual_bound_search'
+            comp = [binaries['compressor'], str(src), str(compressed), str(epsilon)]
+            decomp = [binaries['decompressor'], str(compressed), str(restored), str(epsilon)]
+            if needs_original:
+                decomp.append(str(src))
+            if budget is not None:
+                comp.extend(['--l2-budget', str(budget)])
+            row = dict(file=src.name, command=Path(comp[0]).name,
+                       command_args=shlex.join([Path(arg).name for arg in comp[1:]]),
+                       decompress_command=Path(decomp[0]).name,
+                       decompress_args=shlex.join([Path(arg).name for arg in decomp[1:]]),
+                       mode=mode, epsilon=epsilon, absolute_l_inf_cap=cap,
+                       original_bytes=original_bytes, l2_budget=budget, budget_fraction=fraction)
+            if baseline is not None:
+                row.update(baseline_l2=baseline['l2'], baseline_cr=baseline['compression_ratio'])
+            try:
+                if budget is not None and not math.isfinite(budget):
+                    raise ValueError('Computed L2 budget exceeds float64 range')
+                compressed.unlink(missing_ok=True)
+                restored.unlink(missing_ok=True)
+                elapsed, log = timed_run(comp, args.timeout)
+                size = compressed.stat().st_size
+                if size == 0:
+                    raise RuntimeError('Empty compressed file')
+                row.update(compressed_bytes=size, compression_ratio=original_bytes / size,
+                           compression_time_seconds=elapsed,
+                           compression_throughput_MB_s=original_bytes / 1e6 / elapsed)
+                if budget is not None:
+                    stats = dict(line.split(': ', 1) for line in log.splitlines() if ': ' in line)
+                    row.update(selected_epsilon=float(stats['selected epsilon']),
+                               search_trials=int(stats['search trials']))
+                elapsed, _ = timed_run(decomp, args.timeout)
+                row.update(reconstruction_errors(src, restored, args.precision))
+                row.update(decompression_time_seconds=elapsed,
+                           decompression_throughput_MB_s=original_bytes / 1e6 / elapsed,
+                           exact_reconstruction=filecmp.cmp(src, restored, shallow=False))
+                filecmp.clear_cache()
+                if row['l_inf'] > cap or (budget is not None and row['l2'] > budget):
+                    raise RuntimeError('Measured reconstruction error exceeds requested bound')
+                row['status'] = 'pass'
+            except (RuntimeError, ValueError, OSError, KeyError, subprocess.TimeoutExpired) as exc:
+                failures += 1
+                row.update(status='fail', failure=str(exc).splitlines()[-1][:180])
+                print(f'{src.name}, epsilon={epsilon}, budget={budget}: {exc}', file=sys.stderr)
+            writer.writerow(row)
             report.flush()
-            print(f'{mode}: epsilon={epsilon:.6g}, ratio={original_bytes / compressed_bytes:.4f}x',
-                  file=sys.stderr)
             row_count += 1
-            return errors
+            return row
 
         input_range = None
         if needs_original:
@@ -218,30 +205,26 @@ def main():
                     minimum = min(minimum, min(values))
                     maximum = max(maximum, max(values))
             input_range = maximum - minimum
-        for mode, lossy, l2 in MODES:
-            for epsilon in EPSILONS:
-                errors = run_case(mode, lossy, l2, epsilon)
-                if l2:
-                    matched_epsilon = errors['l_inf']
-                    if matched_epsilon == 0:
-                        print(f'Skipping matched L-inf run for epsilon={epsilon:.6g}: '
-                              'measured L-inf is zero; SLEEK requires a positive bound.',
-                              file=sys.stderr)
-                        continue
-                    if input_range is not None:
-                        if not math.isfinite(input_range) or input_range <= 0:
-                            raise RuntimeError('Cannot convert L-inf to a range-relative tolerance')
-                        matched_epsilon /= input_range
-                    if not math.isfinite(matched_epsilon) or matched_epsilon <= 0:
-                        raise RuntimeError('Matched L-inf epsilon is not positive and finite')
-                    run_case('lossy_without_L2_matched_l_inf', True, False,
-                             matched_epsilon, format(epsilon, '.17g'))
-    print(f'Wrote {row_count} rows to {output}')
+        for epsilon in EPSILONS:
+            cap = epsilon if input_range is None else epsilon * input_range
+            baseline = run_case(epsilon, cap)
+            if args.l2_budget is not None:
+                run_case(epsilon, cap, args.l2_budget,
+                         baseline=baseline if 'l2' in baseline else None)
+            elif 'l2' in baseline:
+                e0 = baseline['l2']
+                if e0 == 0:
+                    run_case(epsilon, cap, 0.0, baseline=baseline)
+                else:
+                    for fraction in dict.fromkeys(args.budget_fractions):
+                        run_case(epsilon, cap, fraction * e0, fraction, baseline)
+    print(f'{src.name}: {row_count} attempted runs, {failures} failed. Results: {output}')
+    return 1 if failures else 0
 
 
 if __name__ == '__main__':
     try:
-        main()
+        sys.exit(main())
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
         print(f'Error: {exc}', file=sys.stderr)
         sys.exit(1)
